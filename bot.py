@@ -7,27 +7,26 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from webapp import create_app
-from storage import get_authorized_user, get_stats
+from storage import init_db, get_authorized_users, get_stats, set_guild_role
 from discord_api import ensure_member_and_role, refresh_access_token
 
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 PREFIX = os.getenv("BOT_PREFIX", "!")
 PORT = int(os.getenv("PORT", "5000"))
 
-if not TOKEN or not GUILD_ID:
-    raise RuntimeError("Set BOT_TOKEN and GUILD_ID in your .env file.")
+if not TOKEN:
+    raise RuntimeError("Set BOT_TOKEN in your .env file.")
 
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
+
 class VerifyView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, guild_id):
         super().__init__(timeout=None)
         base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
         if not base_url:
@@ -35,8 +34,9 @@ class VerifyView(discord.ui.View):
         self.add_item(discord.ui.Button(
             label="Verify / Join",
             style=discord.ButtonStyle.link,
-            url=f"{base_url}/verify?guild_id={GUILD_ID}"
+            url=f"{base_url}/verify?guild_id={guild_id}"
         ))
+
 
 @bot.event
 async def on_ready():
@@ -47,63 +47,136 @@ async def on_ready():
         print(f"Slash-command sync failed: {exc}")
     print(f"Bot ready. Prefix: {PREFIX}")
 
-@bot.tree.command(name="setup", description="Post the server verification panel.")
+
+@bot.tree.command(name="setup", description="Configure this server's verified role and post its verification panel.")
+@app_commands.describe(verified_role="Role given to members after they verify")
 @app_commands.checks.has_permissions(administrator=True)
-async def setup(interaction: discord.Interaction):
-    if not interaction.guild or interaction.guild.id != GUILD_ID:
-        await interaction.response.send_message("This command is configured for a different server.", ephemeral=True)
+async def setup(interaction: discord.Interaction, verified_role: discord.Role):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("Run this command inside a server.", ephemeral=True)
         return
-    embed = discord.Embed(
-        title="Server Verification",
-        description="Click **Verify / Join** to authorize Discord and join this server. You will be asked to approve access.",
-        color=discord.Color.blurple()
-    )
-    await interaction.channel.send(embed=embed, view=VerifyView())
-    await interaction.response.send_message("Verification panel posted.", ephemeral=True)
+
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_roles:
+        await interaction.response.send_message("I need the Manage Roles permission.", ephemeral=True)
+        return
+    if verified_role >= bot_member.top_role:
+        await interaction.response.send_message(
+            "Move my bot role above the verified role, then run /setup again.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        view = VerifyView(guild.id)
+        await interaction.response.defer(ephemeral=True)
+        set_guild_role(str(guild.id), str(verified_role.id))
+        embed = discord.Embed(
+            title="Server Verification",
+            description="Click **Verify / Join** to authorize Discord and join this server.",
+            color=discord.Color.blurple()
+        )
+        await interaction.channel.send(embed=embed, view=view)
+        await interaction.followup.send(
+            f"Verification panel posted. Members who verify here will receive {verified_role.mention}.",
+            ephemeral=True
+        )
+    except Exception as exc:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"Setup failed: {exc}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Setup failed: {exc}", ephemeral=True)
+
 
 @bot.command(name="member")
 @commands.has_permissions(administrator=True)
-async def member(ctx, user: discord.User):
-    """Add/verify a user only if they previously authorized this configured server."""
-    record = get_authorized_user(str(user.id), str(GUILD_ID))
-    if not record:
-        await ctx.reply("That user has not authorized this server through the verification page.")
+async def member(ctx):
+    """Retry adding every user who authorized this server."""
+    if ctx.guild is None:
+        await ctx.reply("This command can only be used inside a server.")
         return
-    try:
-        access_token = await asyncio.to_thread(refresh_access_token, str(user.id), str(GUILD_ID), record)
-        result = await asyncio.to_thread(ensure_member_and_role, str(GUILD_ID), str(user.id), access_token)
-        await ctx.reply(result)
-    except Exception as exc:
-        await ctx.reply(f"Could not add/verify that member: {exc}")
+
+    records = await asyncio.to_thread(get_authorized_users, str(ctx.guild.id))
+    if not records:
+        await ctx.reply("No users have authorized this server yet.")
+        return
+
+    status = await ctx.reply(f"Processing {len(records)} authorized member(s)...")
+    succeeded = 0
+    failed = []
+
+    for record in records:
+        user_id = record["user_id"]
+        try:
+            access_token = await asyncio.to_thread(
+                refresh_access_token, user_id, str(ctx.guild.id), record
+            )
+            await asyncio.to_thread(
+                ensure_member_and_role, str(ctx.guild.id), user_id, access_token
+            )
+            succeeded += 1
+        except Exception as exc:
+            failed.append((user_id, str(exc)[:180]))
+
+    summary = (
+        f"**Finished processing authorized members**\n"
+        f"Successful: **{succeeded}**\n"
+        f"Failed: **{len(failed)}**"
+    )
+    if failed:
+        summary += "\n\n**Failures (first 10):**\n" + "\n".join(
+            f"• <@{user_id}> — {reason}" for user_id, reason in failed[:10]
+        )
+    await status.edit(content=summary[:1900])
+
 
 @bot.command(name="stats")
 @commands.has_permissions(administrator=True)
 async def stats(ctx):
-    data = get_stats(str(GUILD_ID))
+    if ctx.guild is None:
+        await ctx.reply("This command can only be used inside a server.")
+        return
+    data = await asyncio.to_thread(get_stats, str(ctx.guild.id))
     await ctx.reply(
         f"**Verification stats for this server**\n"
         f"Authorized users: **{data['authorized']}**\n"
         f"Joined/role applied: **{data['joined']}**"
     )
 
+
+@setup.error
+async def setup_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need Administrator permission to use this command."
+    else:
+        message = f"Setup failed: {error}"
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
 @member.error
 async def member_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.reply("You need Administrator permission to use this command.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.reply(f"Usage: `{PREFIX}member @user`")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.reply(f"Usage: `{PREFIX}member @user`")
+    else:
+        await ctx.reply(f"Could not process members: {error}")
+
 
 @stats.error
 async def stats_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.reply("You need Administrator permission to use this command.")
 
+
 def run_web():
     app = create_app()
     app.run(host="127.0.0.1", port=PORT, threaded=True, use_reloader=False)
 
+
 if __name__ == "__main__":
+    init_db()
     threading.Thread(target=run_web, daemon=True).start()
     bot.run(TOKEN)
